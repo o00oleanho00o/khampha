@@ -16,9 +16,34 @@ static const char *OPENAI_URL =
 static const char *OPENAI_MODEL =
     "gpt-5-mini";
 
-// Giữ context hội thoại.
-// Chỉ cập nhật khi response status = completed.
+// XIAO ESP32S3 onboard USER LED
+static const int LED_PIN = 1;
+
+// LED hiện tại đang bật hay tắt
+bool ledState = false;
+
+// Conversation hiện tại
 String previousResponseId = "";
+
+
+// =====================================================
+// LED
+// =====================================================
+
+void setLed(bool state)
+{
+    ledState = state;
+
+    // XIAO LED là active-low:
+    // LOW  = ON
+    // HIGH = OFF
+    digitalWrite(
+        LED_PIN,
+        state ? LOW : HIGH);
+
+    Serial.print("[Device] LED = ");
+    Serial.println(state ? "ON" : "OFF");
+}
 
 
 // =====================================================
@@ -61,15 +86,15 @@ bool connectWiFi()
 
 
 // =====================================================
-// HTTP POST TO OPENAI
+// HTTP POST
 // =====================================================
 
 String postOpenAI(const String &body)
 {
-    // Nếu WiFi bị mất thì reconnect
     if (WiFi.status() != WL_CONNECTED)
     {
-        Serial.println("[WiFi] Lost connection. Reconnecting...");
+        Serial.println(
+            "[WiFi] Lost connection. Reconnecting...");
 
         if (!connectWiFi())
         {
@@ -79,11 +104,7 @@ String postOpenAI(const String &body)
 
     WiFiClientSecure client;
 
-    // =================================================
-    // PROTOTYPE ONLY
-    // Bỏ verify certificate để test cho đơn giản.
-    // Sau này có thể chuyển sang CA certificate.
-    // =================================================
+    // Prototype only
     client.setInsecure();
 
     HTTPClient http;
@@ -94,7 +115,6 @@ String postOpenAI(const String &body)
         return "";
     }
 
-    // Web search đôi khi mất vài giây
     http.setTimeout(90000);
 
     http.addHeader(
@@ -107,19 +127,25 @@ String postOpenAI(const String &body)
 
     Serial.println("[OpenAI] Sending...");
 
-    int statusCode = http.POST(body);
+    int statusCode =
+        http.POST(body);
 
-    String response = http.getString();
+    String response =
+        http.getString();
 
     Serial.print("[HTTP] Status: ");
     Serial.println(statusCode);
 
-    if (statusCode < 200 || statusCode >= 300)
+    if (statusCode < 200 ||
+        statusCode >= 300)
     {
-        Serial.println("[OpenAI] Error:");
+        Serial.println(
+            "[OpenAI] Error:");
+
         Serial.println(response);
 
         http.end();
+
         return "";
     }
 
@@ -130,7 +156,154 @@ String postOpenAI(const String &body)
 
 
 // =====================================================
-// EXTRACT OUTPUT TEXT
+// ADD TOOLS + COMMON SETTINGS
+// =====================================================
+
+void configureRequest(JsonDocument &request)
+{
+    request["model"] =
+        OPENAI_MODEL;
+
+    request["instructions"] =
+        "You are Pet AI running on a XIAO ESP32S3. "
+        "The user communicates through a serial terminal. "
+        "Respond naturally in the same language as the user. "
+        "Keep answers concise. "
+        "You can physically control the onboard LED using "
+        "the set_led tool. "
+        "Whenever the user asks to turn the physical LED or "
+        "light on or off, use set_led. "
+        "Never claim that you changed the physical LED unless "
+        "you actually use the set_led tool. "
+        "Use web search only when current or up-to-date "
+        "information is required.";
+
+    request["max_output_tokens"] =
+        1200;
+
+    // Chỉ xử lý 1 custom tool một lần để firmware đơn giản
+    request["parallel_tool_calls"] =
+        false;
+
+    request["tool_choice"] =
+        "auto";
+
+
+    // -------------------------------------------------
+    // Reasoning
+    // -------------------------------------------------
+
+    JsonObject reasoning =
+        request["reasoning"].to<JsonObject>();
+
+    reasoning["effort"] =
+        "low";
+
+
+    // -------------------------------------------------
+    // Output verbosity
+    // -------------------------------------------------
+
+    JsonObject text =
+        request["text"].to<JsonObject>();
+
+    text["verbosity"] =
+        "low";
+
+
+    // =================================================
+    // TOOLS
+    // =================================================
+
+    JsonArray tools =
+        request["tools"].to<JsonArray>();
+
+
+    // -------------------------------------------------
+    // TOOL 1: WEB SEARCH
+    // -------------------------------------------------
+
+    JsonObject webSearch =
+        tools.add<JsonObject>();
+
+    webSearch["type"] =
+        "web_search";
+
+    webSearch["search_context_size"] =
+        "low";
+
+    JsonObject location =
+        webSearch["user_location"].to<JsonObject>();
+
+    location["type"] =
+        "approximate";
+
+    location["country"] =
+        "VN";
+
+    location["timezone"] =
+        "Asia/Ho_Chi_Minh";
+
+
+    // -------------------------------------------------
+    // TOOL 2: SET LED
+    // -------------------------------------------------
+
+    JsonObject ledTool =
+        tools.add<JsonObject>();
+
+    ledTool["type"] =
+        "function";
+
+    ledTool["name"] =
+        "set_led";
+
+    ledTool["description"] =
+        "Turn the physical onboard LED of the "
+        "XIAO ESP32S3 on or off.";
+
+    ledTool["strict"] =
+        true;
+
+
+    // JSON Schema:
+    //
+    // {
+    //   "state": true/false
+    // }
+
+    JsonObject parameters =
+        ledTool["parameters"].to<JsonObject>();
+
+    parameters["type"] =
+        "object";
+
+
+    JsonObject properties =
+        parameters["properties"].to<JsonObject>();
+
+    JsonObject stateProperty =
+        properties["state"].to<JsonObject>();
+
+    stateProperty["type"] =
+        "boolean";
+
+    stateProperty["description"] =
+        "true means LED on, false means LED off";
+
+
+    JsonArray required =
+        parameters["required"].to<JsonArray>();
+
+    required.add("state");
+
+    parameters["additionalProperties"] =
+        false;
+}
+
+
+// =====================================================
+// EXTRACT ASSISTANT TEXT
 // =====================================================
 
 String extractOutputText(JsonDocument &doc)
@@ -145,7 +318,6 @@ String extractOutputText(JsonDocument &doc)
         const char *type =
             item["type"] | "";
 
-        // Chỉ lấy assistant message
         if (strcmp(type, "message") != 0)
         {
             continue;
@@ -159,7 +331,9 @@ String extractOutputText(JsonDocument &doc)
             const char *partType =
                 part["type"] | "";
 
-            if (strcmp(partType, "output_text") != 0)
+            if (strcmp(
+                    partType,
+                    "output_text") != 0)
             {
                 continue;
             }
@@ -186,7 +360,48 @@ String extractOutputText(JsonDocument &doc)
 
 
 // =====================================================
-// CHECK IF WEB SEARCH WAS USED
+// FIND FUNCTION CALL
+// =====================================================
+
+bool findFunctionCall(
+    JsonDocument &doc,
+    String &functionName,
+    String &arguments,
+    String &callId)
+{
+    JsonArray output =
+        doc["output"].as<JsonArray>();
+
+    for (JsonObject item : output)
+    {
+        const char *type =
+            item["type"] | "";
+
+        if (strcmp(
+                type,
+                "function_call") != 0)
+        {
+            continue;
+        }
+
+        functionName =
+            item["name"].as<String>();
+
+        arguments =
+            item["arguments"].as<String>();
+
+        callId =
+            item["call_id"].as<String>();
+
+        return true;
+    }
+
+    return false;
+}
+
+
+// =====================================================
+// WEB SEARCH USED?
 // =====================================================
 
 bool responseUsedWebSearch(JsonDocument &doc)
@@ -199,7 +414,9 @@ bool responseUsedWebSearch(JsonDocument &doc)
         const char *type =
             item["type"] | "";
 
-        if (strcmp(type, "web_search_call") == 0)
+        if (strcmp(
+                type,
+                "web_search_call") == 0)
         {
             return true;
         }
@@ -210,7 +427,7 @@ bool responseUsedWebSearch(JsonDocument &doc)
 
 
 // =====================================================
-// PRINT TOKEN USAGE
+// TOKEN USAGE
 // =====================================================
 
 void printUsage(JsonDocument &doc)
@@ -227,12 +444,12 @@ void printUsage(JsonDocument &doc)
         doc["usage"]["output_tokens"] | 0;
 
     int reasoningTokens =
-        doc["usage"]["output_tokens_details"]["reasoning_tokens"] | 0;
+        doc["usage"]["output_tokens_details"]
+           ["reasoning_tokens"] | 0;
 
     int totalTokens =
         doc["usage"]["total_tokens"] | 0;
 
-    Serial.println();
     Serial.print("[Usage] input=");
     Serial.print(inputTokens);
 
@@ -248,107 +465,138 @@ void printUsage(JsonDocument &doc)
 
 
 // =====================================================
-// ASK OPENAI
+// EXECUTE LOCAL FUNCTION
+// =====================================================
+
+String executeFunction(
+    const String &functionName,
+    const String &arguments)
+{
+    Serial.println();
+
+    Serial.print("[Tool] Function: ");
+    Serial.println(functionName);
+
+    Serial.print("[Tool] Arguments: ");
+    Serial.println(arguments);
+
+
+    // =================================================
+    // set_led
+    // =================================================
+
+    if (functionName == "set_led")
+    {
+        JsonDocument argsDoc;
+
+        DeserializationError error =
+            deserializeJson(
+                argsDoc,
+                arguments);
+
+        if (error)
+        {
+            Serial.println(
+                "[Tool] Invalid JSON arguments");
+
+            return
+                "{\"success\":false,"
+                "\"error\":\"invalid_arguments\"}";
+        }
+
+        bool state =
+            argsDoc["state"] | false;
+
+        // Đây là hành động vật lý thật
+        setLed(state);
+
+
+        // Kết quả trả lại cho AI
+        JsonDocument resultDoc;
+
+        resultDoc["success"] =
+            true;
+
+        resultDoc["led"] =
+            state ? "on" : "off";
+
+        String result;
+
+        serializeJson(
+            resultDoc,
+            result);
+
+        return result;
+    }
+
+
+    // Không nhận diện được function
+    return
+        "{\"success\":false,"
+        "\"error\":\"unknown_function\"}";
+}
+
+
+// =====================================================
+// BUILD TOOL RESULT REQUEST
+// =====================================================
+
+String sendFunctionResult(
+    const String &responseId,
+    const String &callId,
+    const String &functionResult)
+{
+    JsonDocument request;
+
+    configureRequest(request);
+
+    // Tiếp tục ngay sau response chứa function_call
+    request["previous_response_id"] =
+        responseId;
+
+
+    JsonArray input =
+        request["input"].to<JsonArray>();
+
+    JsonObject output =
+        input.add<JsonObject>();
+
+    output["type"] =
+        "function_call_output";
+
+    output["call_id"] =
+        callId;
+
+    output["output"] =
+        functionResult;
+
+
+    String body;
+
+    serializeJson(
+        request,
+        body);
+
+    return postOpenAI(body);
+}
+
+
+// =====================================================
+// ASK AI
 // =====================================================
 
 void askAI(const String &userMessage)
 {
-    // -------------------------------------------------
-    // Build request
-    // -------------------------------------------------
+    // =================================================
+    // FIRST REQUEST
+    // =================================================
 
     JsonDocument request;
 
-    request["model"] = OPENAI_MODEL;
-
-    request["instructions"] =
-        "You are Pet AI running on a XIAO ESP32S3. "
-        "The user is communicating through a serial terminal. "
-        "Respond naturally in the same language as the user. "
-        "Keep answers concise. "
-        "Use web search only when the question requires current "
-        "or up-to-date information. "
-        "If a question depends on the user's exact location and "
-        "the user did not provide a location, ask for it.";
+    configureRequest(request);
 
     request["input"] =
         userMessage;
-
-    // Quan trọng:
-    // 500 trước đây quá thấp khi GPT-5 dùng reasoning + web search.
-    request["max_output_tokens"] = 1200;
-
-
-    // -------------------------------------------------
-    // Reasoning
-    //
-    // GPT-5-mini mặc định có thể dành khá nhiều token
-    // cho reasoning. Dùng low cho prototype nhanh/rẻ hơn.
-    // -------------------------------------------------
-
-    JsonObject reasoning =
-        request["reasoning"].to<JsonObject>();
-
-    reasoning["effort"] =
-        "low";
-
-
-    // -------------------------------------------------
-    // Text output
-    // -------------------------------------------------
-
-    JsonObject text =
-        request["text"].to<JsonObject>();
-
-    text["verbosity"] =
-        "low";
-
-
-    // -------------------------------------------------
-    // WEB SEARCH TOOL
-    // -------------------------------------------------
-
-    JsonArray tools =
-        request["tools"].to<JsonArray>();
-
-    JsonObject webSearch =
-        tools.add<JsonObject>();
-
-    webSearch["type"] =
-        "web_search";
-
-    // Dùng ít search context hơn:
-    // nhanh hơn + ít token hơn cho prototype
-    webSearch["search_context_size"] =
-        "low";
-
-
-    // -------------------------------------------------
-    // Approximate location cho Web Search
-    //
-    // Không hard-code thành phố.
-    // Nếu hỏi "thời tiết Hà Nội" thì model dùng Hà Nội.
-    //
-    // Nếu thiết bị của bạn không dùng ở Việt Nam,
-    // hãy đổi hai giá trị này.
-    // -------------------------------------------------
-
-    JsonObject location =
-        webSearch["user_location"].to<JsonObject>();
-
-    location["type"] =
-        "approximate";
-
-    location["country"] =
-        "VN";
-
-    location["timezone"] =
-        "Asia/Ho_Chi_Minh";
-
-
-    // -------------------------------------------------
-    // Conversation memory
-    // -------------------------------------------------
 
     if (!previousResponseId.isEmpty())
     {
@@ -357,10 +605,6 @@ void askAI(const String &userMessage)
     }
 
 
-    // -------------------------------------------------
-    // Serialize JSON
-    // -------------------------------------------------
-
     String body;
 
     serializeJson(
@@ -368,88 +612,187 @@ void askAI(const String &userMessage)
         body);
 
 
-    // -------------------------------------------------
-    // Send request
-    // -------------------------------------------------
-
     String response =
         postOpenAI(body);
 
     if (response.isEmpty())
     {
-        Serial.println("[AI] Empty response.");
-        return;
-    }
-
-
-    // -------------------------------------------------
-    // Parse response
-    // -------------------------------------------------
-
-    JsonDocument responseDoc;
-
-    DeserializationError error =
-        deserializeJson(
-            responseDoc,
-            response);
-
-    if (error)
-    {
-        Serial.print("[JSON] Parse error: ");
-        Serial.println(error.c_str());
-
-        Serial.print("[JSON] Response length: ");
-        Serial.println(response.length());
+        Serial.println(
+            "[AI] Empty response.");
 
         return;
     }
 
 
-    // -------------------------------------------------
-    // Read status
-    // -------------------------------------------------
-
-    String status =
-        responseDoc["status"] | "unknown";
-
-
-    // -------------------------------------------------
-    // Show whether web search happened
-    // -------------------------------------------------
-
-    if (responseUsedWebSearch(responseDoc))
-    {
-        Serial.println("[Tool] Web search used");
-    }
-
-
-    // -------------------------------------------------
-    // Token usage
-    // -------------------------------------------------
-
-    printUsage(responseDoc);
-
-
-    // -------------------------------------------------
-    // Extract assistant text
-    // -------------------------------------------------
-
-    String answer =
-        extractOutputText(responseDoc);
-
-
     // =================================================
-    // COMPLETED
+    // TOOL LOOP
+    //
+    // Cho phép tối đa 3 vòng function calling.
     // =================================================
 
-    if (status == "completed")
+    for (int toolRound = 0;
+         toolRound < 3;
+         toolRound++)
     {
-        // Chỉ completed mới được trở thành conversation head.
-        if (!responseDoc["id"].isNull())
+        JsonDocument responseDoc;
+
+        DeserializationError error =
+            deserializeJson(
+                responseDoc,
+                response);
+
+        if (error)
         {
-            previousResponseId =
-                responseDoc["id"].as<String>();
+            Serial.print(
+                "[JSON] Parse error: ");
+
+            Serial.println(
+                error.c_str());
+
+            return;
         }
+
+
+        String status =
+            responseDoc["status"] | "unknown";
+
+
+        // ---------------------------------------------
+        // WEB SEARCH
+        // ---------------------------------------------
+
+        if (responseUsedWebSearch(
+                responseDoc))
+        {
+            Serial.println(
+                "[Tool] Web search used");
+        }
+
+
+        // ---------------------------------------------
+        // USAGE
+        // ---------------------------------------------
+
+        printUsage(responseDoc);
+
+
+        // ---------------------------------------------
+        // INCOMPLETE
+        // ---------------------------------------------
+
+        if (status == "incomplete")
+        {
+            String reason =
+                responseDoc
+                    ["incomplete_details"]
+                    ["reason"] |
+                "unknown";
+
+            Serial.print(
+                "[AI] Response incomplete: ");
+
+            Serial.println(reason);
+
+            Serial.println(
+                "[AI] Conversation state NOT advanced.");
+
+            return;
+        }
+
+
+        // ---------------------------------------------
+        // ERROR / OTHER STATUS
+        // ---------------------------------------------
+
+        if (status != "completed")
+        {
+            Serial.print(
+                "[AI] Unexpected status: ");
+
+            Serial.println(status);
+
+            return;
+        }
+
+
+        String responseId =
+            responseDoc["id"].as<String>();
+
+
+        // =================================================
+        // CHECK CUSTOM FUNCTION CALL
+        // =================================================
+
+        String functionName;
+        String arguments;
+        String callId;
+
+        bool hasFunctionCall =
+            findFunctionCall(
+                responseDoc,
+                functionName,
+                arguments,
+                callId);
+
+
+        if (hasFunctionCall)
+        {
+            // -----------------------------------------
+            // ESP32 EXECUTES REAL HARDWARE FUNCTION
+            // -----------------------------------------
+
+            String functionResult =
+                executeFunction(
+                    functionName,
+                    arguments);
+
+
+            Serial.print(
+                "[Tool] Result: ");
+
+            Serial.println(
+                functionResult);
+
+
+            // -----------------------------------------
+            // SEND RESULT BACK TO MODEL
+            // -----------------------------------------
+
+            response =
+                sendFunctionResult(
+                    responseId,
+                    callId,
+                    functionResult);
+
+
+            if (response.isEmpty())
+            {
+                Serial.println(
+                    "[AI] Tool follow-up failed.");
+
+                return;
+            }
+
+            // Có response mới.
+            // Quay lại vòng for để parse tiếp.
+            continue;
+        }
+
+
+        // =================================================
+        // FINAL TEXT RESPONSE
+        // =================================================
+
+        String answer =
+            extractOutputText(
+                responseDoc);
+
+
+        // Chỉ response cuối cùng mới trở thành
+        // conversation head.
+        previousResponseId =
+            responseId;
+
 
         Serial.println();
 
@@ -461,57 +804,20 @@ void askAI(const String &userMessage)
         else
         {
             Serial.println(
-                "[AI] Response completed but no output_text was found.");
+                "[AI] Completed but no output_text.");
         }
 
         return;
     }
 
 
-    // =================================================
-    // INCOMPLETE
-    // =================================================
-
-    if (status == "incomplete")
-    {
-        String reason =
-            responseDoc["incomplete_details"]["reason"] | "unknown";
-
-        Serial.println();
-        Serial.print("[AI] Response incomplete: ");
-        Serial.println(reason);
-
-        // Nếu có partial text thì vẫn cho xem,
-        // nhưng KHÔNG nối conversation vào response này.
-        if (!answer.isEmpty())
-        {
-            Serial.println();
-            Serial.print("AI (partial)> ");
-            Serial.println(answer);
-        }
-
-        Serial.println(
-            "[AI] Conversation state NOT advanced.");
-
-        return;
-    }
-
-
-    // =================================================
-    // OTHER STATUS
-    // =================================================
-
-    Serial.println();
-
-    Serial.print("[AI] Unexpected response status: ");
-    Serial.println(status);
-
-    // Không cập nhật previousResponseId
+    Serial.println(
+        "[AI] Too many tool calls.");
 }
 
 
 // =====================================================
-// SERIAL INPUT
+// SERIAL
 // =====================================================
 
 void processSerial()
@@ -532,9 +838,9 @@ void processSerial()
     }
 
 
-    // -------------------------------------------------
-    // Local reset command
-    // -------------------------------------------------
+    // =================================================
+    // RESET CONVERSATION
+    // =================================================
 
     if (input == "/reset")
     {
@@ -550,10 +856,6 @@ void processSerial()
         return;
     }
 
-
-    // -------------------------------------------------
-    // Send to AI
-    // -------------------------------------------------
 
     Serial.println();
 
@@ -573,9 +875,29 @@ void processSerial()
 
 void setup()
 {
+    // =================================================
+    // LED
+    // =================================================
+
+    pinMode(
+        LED_PIN,
+        OUTPUT);
+
+    // LED active-low:
+    // HIGH = OFF
+    digitalWrite(
+        LED_PIN,
+        HIGH);
+
+    ledState = false;
+
+
+    // =================================================
+    // SERIAL
+    // =================================================
+
     Serial.begin(115200);
 
-    // Cho USB CDC có thời gian enumerate
     delay(2500);
 
     Serial.println();
@@ -583,15 +905,21 @@ void setup()
         "====================================");
 
     Serial.println(
-        "       PET AI - SERIAL V0");
+        "        PET AI - XIAO V1");
 
     Serial.println(
-        "       XIAO ESP32S3");
+        "        Chat + Web + LED");
 
     Serial.println(
         "====================================");
 
+
+    // =================================================
+    // WIFI
+    // =================================================
+
     connectWiFi();
+
 
     Serial.println();
 
@@ -599,10 +927,13 @@ void setup()
         "Ask me anything.");
 
     Serial.println(
+        "AI can control the onboard LED.");
+
+    Serial.println(
         "Web search is enabled.");
 
     Serial.println(
-        "Type /reset to start a new conversation.");
+        "Type /reset to reset conversation.");
 
     Serial.println();
 
